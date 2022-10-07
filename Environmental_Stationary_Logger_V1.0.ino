@@ -32,11 +32,13 @@ const uint8_t bsec_config_iaq[] =
 // Tube dead time in seconds
 // SI-22G = 0.000xxx seconds <- still searching/ researching actual data
 // SBM-20 = 0.000190 seconds
+// SBM-19 = 0.000250 seconds
 #define tubeDeadTime 0.000190
 
 // Tube conversion value
 // SI-22G = 0.001714
 // SBM-20 = 0.006315
+// SBM-19 = 
 #define tubeConversionFactor 0.001714
 
 // 360 minutes (6 hours) = saving 4 times a day
@@ -61,17 +63,17 @@ float var_temperature = 0.0, var_humidity = 0.0, var_pressure = 0.0, var_voc = 0
 //unsigned long cps_1 = 0, cps_2 = 0;
 int16_t cps_1 = 0, cps_2 = 0;
 unsigned long actual_cps_1 = 0, actual_cps_2 = 0;
-unsigned long cpm = 0, cpm_temp = 0;
-unsigned long sensorMovingAvg = 0;
+unsigned long cpm = 0, cpm_1 = 0, cpm_2 = 0, cpm_temp = 0, cpm_temp_1 = 0;
+unsigned long sensorMovingAvg = 0, sensorMovingAvg_1 = 0, sensorMovingAvg_2 = 0;
 unsigned long currentMillis = 0, previousMillis_1 = 0, previousMillis_2 = 0, previousMillis_3 = 0;
 unsigned long luminosity = 0;
 
 bool updateEEPROM = false;
 
 // Create and set sensor to 120 data points for moving average (2x 60 second data entry points)
+movingAvg cps_sensor_1(60);
+movingAvg cps_sensor_2(60);
 movingAvg cps_sensor(120);
-
-boolean eventTriggerd = false;
 
 // Create time_t object
 time_t epoch = 0;
@@ -86,17 +88,22 @@ Tomoto_HM330X pm_sensor;
 // Tomoto_HM330X sensor(Wire1); // to use the alternative wire
 
 // ESP32 Pulse Counter
+static pcnt_config_t pcnt_config_01 = {};
+static pcnt_config_t pcnt_config_02 = {};
+
 #define PCNT_UNIT_01 PCNT_UNIT_0   // Select the Pulse Counter Unit 0
 #define PCNT_UNIT_02 PCNT_UNIT_1   // Select the Pulse Counter Unit 1
 
-#define PCNT_H_LIM_VAL 125          // Set the high limit count to trigger the interrupt
-#define PCNT_L_LIM_VAL 0            // Set the low limit count to trigger the interrupt
-#define PCNT_FILTER_VAL 128         // Set the filter value in nanoseconds, 1 second = 1 000 000 000 nanoseconds
+#define PCNT_H_LIM_VAL 1250          // Set the high limit count to trigger the interrupt
+//#define PCNT_L_LIM_VAL 0            // Set the low limit count to trigger the interrupt
+#define PCNT_FILTER_VAL 100         // Set the filter value 0-1023
 
 #define PCNT_INPUT_SIG_IO_01 13     // Pulse Input selected as GPIO14
 #define PCNT_INPUT_SIG_IO_02 14     // Pulse Input selected as GPIO12
 
-pcnt_isr_handle_t user_isr_handle = NULL; // User ISR handler for Interrupt
+pcnt_isr_handle_t user_isr_handle_1 = NULL; // User ISR handler for Interrupt
+pcnt_isr_handle_t user_isr_handle_2 = NULL; // User ISR handler for Interrupt
+volatile bool eventTriggerd = false;
 
 // WiFi credentials
 const char *my_ssid = SECRET_SSID;
@@ -162,11 +169,13 @@ void setup()
     // Initialize variables
     cps_1 = 0, cps_2 = 0;
     actual_cps_1 = 0, actual_cps_2 = 0;
-    sensorMovingAvg = 0;
+    sensorMovingAvg = 0, sensorMovingAvg_1 = 0, sensorMovingAvg_2 = 0;
     increaseSecCount = 1;
   
     // Initialize sensor
     cps_sensor.begin();
+    cps_sensor_1.begin();
+    cps_sensor_2.begin();
   
     // Initialize Arduino pins
     pinMode(33, INPUT_PULLUP);  // Set pin34 (GPIO33) input for ADC1_CHANNEL_5
@@ -225,7 +234,7 @@ void setup()
     TSL2561.init();
     Serial.println(F("Valid TSL2561 found."));
 
-    // Testing of Pulse Counter (PCNT)
+    // Pulse Counter (PCNT)
     Init_PulseCounter_01();
     Init_PulseCounter_02();
     
@@ -245,18 +254,19 @@ void setup()
 //-----------------//
 void loop()
 {
+  if(eventTriggerd)
+  {
+    Serial.println(F("--- ISR ---"));
+    Serial.println("| Counter of tube exceeded the value of " + String(PCNT_H_LIM_VAL));
+    Serial.println(F("--- ISR ---"));
+
+    eventTriggerd = false;
+  }
+
   // If reached 01 seconds with a total of 60 seconds
   if (((millis() - previousMillis_1) >= 1000UL) && (increaseSecCount <= 60))
   {
-    if(eventTriggerd)
-    {
-      Serial.println(F("--- ISR ---"));
-      Serial.println("| Counter of tube exceeded the value of " + String(PCNT_H_LIM_VAL));
-      Serial.println(F("--- ISR ---"));
-
-      eventTriggerd = false;
-    }
-
+    // Get the pulse counter of unit_x and store it in var_y
     pcnt_get_counter_value(PCNT_UNIT_01, &cps_1);
     pcnt_get_counter_value(PCNT_UNIT_02, &cps_2);
 
@@ -267,6 +277,8 @@ void loop()
     // Add a new datapoint entry for both tubes to the moving average array
     sensorMovingAvg = cps_sensor.reading(actual_cps_1);
     sensorMovingAvg = cps_sensor.reading(actual_cps_2);
+    sensorMovingAvg_1 = cps_sensor_1.reading(actual_cps_1);
+    sensorMovingAvg_2 = cps_sensor_2.reading(actual_cps_2);
     
     //   // Uncomment below for testing 1 sec progress
     //   displayTubeVoltage();
@@ -275,8 +287,10 @@ void loop()
     Serial.println(F("--- 01 sec ---"));
     Serial.println("| Tube 1 " + String(increaseSecCount) + " sec current count (cps_1) = " + String(actual_cps_1));
     Serial.println("| Tube 2 " + String(increaseSecCount) + " sec current count (cps_2) = " + String(actual_cps_2));
+    Serial.println("| Tubes 1 total mavg " + String(increaseSecCount) + " sec current count = " + String(sensorMovingAvg_1));
+    Serial.println("| Tubes 2 total mavg " + String(increaseSecCount) + " sec current count = " + String(sensorMovingAvg_2));
     Serial.println("| Tubes current total mavg " + String(increaseSecCount) + " sec current count = " + String(sensorMovingAvg));
-    Serial.println("| Voltage tubes = " + String(displayTubeVoltage(), 3));
+    Serial.println("| Tubes voltage = " + String(displayTubeVoltage(), 3) + "V");
     Serial.println(F("--- 01 sec ---"));
 
     // Display 1 second tick for a total of 60
@@ -338,6 +352,8 @@ void loop()
       // Serial.println("PM2.5 = " + String(var_pm25));
       // Serial.println("PM10 = " + String(var_pm10));
     }
+
+    previousMillis_2 = millis();
   }
   
   // If 61 seconds have been reached do uploads and reset vars
@@ -355,7 +371,10 @@ void loop()
     {
       // Fetch values
       cpm = cps_sensor.getAvg();
+      cpm_1 = cps_sensor_1.getAvg();
+      cpm_2 = cps_sensor_2.getAvg();
       cpm_temp = cpm;
+      cpm_temp_1 = cpm_1 + cpm_2;
       luminosity = TSL2561.readVisibleLux();
       var_hcho = calculateHCHO();
       //battery = (analogRead(37)/1000), 3; // Read pin 37 CapVP
@@ -370,7 +389,12 @@ void loop()
       Serial.println(F("--- 61 sec ---"));
       Serial.println("| Tube 1 cpm = " + String(actual_cps_1));
       Serial.println("| Tube 2 cpm = " + String(actual_cps_2));
-      Serial.println("| cpm_temp = " + String(cpm_temp));
+      Serial.println("| Tube 1 m.a. cpm = " + String(cpm_1));
+      Serial.println("| Tube 2 m.a. cpm = " + String(cpm_2));
+      Serial.println("| Tubes m.a. 1+2 = " + String(cpm_temp_1));
+      Serial.println("| Tubes m.a. 120 = " + String(cpm_temp));
+      Serial.println("| Tubes voltage = " + String(tubeVoltage)  + "V");
+      Serial.println(F("--- ... ---"));
       Serial.println("| var_temperature = " + String(var_temperature) + " C");
       Serial.println("| var_pressure = " + String(var_pressure) + " hPa");
       Serial.println("| var_humidity = " + String(var_humidity) + " %");
@@ -378,13 +402,15 @@ void loop()
       Serial.println("| var_co2 = " + String(var_co2) + " ppm");
       Serial.println("| IAQ level = " + String(var_iaq));
       Serial.println("| IAQ Accuracy = " + String(var_iaqAccuracy));   // 0 = Stabilizing, 1 = Uncertain, 2 = Calibrating, 3 = Calibrated
+      Serial.println(F("--- ... ---"));
       Serial.println("| luminosity = " + String(luminosity));
+      Serial.println(F("--- ... ---"));
       Serial.println("| var_hcho = " + String(var_hcho));
+      Serial.println(F("--- ... ---"));
       Serial.println("| var_pm01 = " + String(var_pm01));
       Serial.println("| var_pm25 = " + String(var_pm25));
       Serial.println("| var_pm10 = " + String(var_pm10));
-      Serial.println("| tubeVoltage = " + String(tubeVoltage));
-      Serial.println(F("--- 61 sec ---"));
+      Serial.println(F("--- ... ---"));
       Serial.println(F("| Commence uploading"));
       Serial.println(F("| Resetting vars"));
       Serial.println(F("--- 61 sec ---"));
@@ -405,11 +431,13 @@ void loop()
       );
 
       // Reset variables
-      cps_1 = 0, cps_2 = 0, actual_cps_1 = 0, actual_cps_2 = 0, cpm = 0, sensorMovingAvg = 0;
+      cps_1 = 0, cps_2 = 0, actual_cps_1 = 0, actual_cps_2 = 0, cpm = 0, sensorMovingAvg = 0, sensorMovingAvg_1 = 0, sensorMovingAvg_2 = 0;
       increaseSecCount = 1;
       
       Clean_Counters();
       cps_sensor.reset();
+      cps_sensor_1.reset();
+      cps_sensor_2.reset();
 
       // Reset WatchDogTimer
       esp_task_wdt_reset();
@@ -417,8 +445,6 @@ void loop()
       previousMillis_1 = millis();
       previousMillis_2 = millis();
       previousMillis_3 = millis();
-
-      eventTriggerd = false;
     }
   }
 }
@@ -557,7 +583,7 @@ static void uploadTaskFunction(void * parameter)
 
   // Reset variables
   epoch = 0;
-  cpm_temp = 0;
+  cpm_temp = 0, cpm_temp_1 = 0;
   var_temperature = 0.0, var_humidity = 0.0, var_pressure = 0.0, luminosity = 0, var_voc = 0.0, var_co2 = 0.0, var_hcho = 0.0, tubeVoltage = 0.0;
 
   esp_task_wdt_delete(NULL);
@@ -834,50 +860,51 @@ static void updateStateFunction(void * parameter)
 }
 
 // ISR Function for counter 1
-static void IRAM_ATTR Counter_ISR(void *arg)
+static void IRAM_ATTR Counter_ISR_1(void *arg)
 {
   eventTriggerd = true;
+  PCNT.int_clr.val = BIT(PCNT_UNIT_01);
+}
 
-  if(user_isr_handle)
-  {
-    //Free the ISR service handle.
-    esp_intr_free(user_isr_handle);
-    //user_isr_handle = NULL;
-  }
+// ISR Function for counter 2
+static void IRAM_ATTR Counter_ISR_2(void *arg)
+{
+  eventTriggerd = true;
+  PCNT.int_clr.val = BIT(PCNT_UNIT_02);
 }
 
 static void Init_PulseCounter_01(void)
 {
-  pcnt_config_t pcnt_config_01 = { };
-  pcnt_config_01.pulse_gpio_num = PCNT_INPUT_SIG_IO_01;         // Set pulse input GPIO member
-  //pcnt_config_01.ctrl_gpio_num = PCNT_PIN_NOT_USED;
+  pcnt_config_01.pulse_gpio_num = PCNT_INPUT_SIG_IO_01;
+  pcnt_config_01.ctrl_gpio_num = PCNT_PIN_NOT_USED;
+  
   // What to do on the positive / negative edge of pulse input?
-  pcnt_config_01.pos_mode = PCNT_COUNT_INC;   // Count up on the positive edge
-  //pcnt_config_01.neg_mode = PCNT_COUNT_DIS;   // Count down disable
+  pcnt_config_01.pos_mode = PCNT_COUNT_INC;
+  pcnt_config_01.neg_mode = PCNT_COUNT_DIS;
 
   // What to do when control input is low or high?
-  pcnt_config_01.lctrl_mode = PCNT_MODE_KEEP; // Keep the primary counter mode if low
-  pcnt_config_01.hctrl_mode = PCNT_MODE_KEEP;    // Keep the primary counter mode 
+  pcnt_config_01.lctrl_mode = PCNT_MODE_KEEP;
+  pcnt_config_01.hctrl_mode = PCNT_MODE_KEEP;
 
   // Set the maximum and minimum limit values to watch
   pcnt_config_01.counter_h_lim  = PCNT_H_LIM_VAL;
-  pcnt_config_01.counter_l_lim  = PCNT_L_LIM_VAL;
+  //pcnt_config_01.counter_l_lim  = PCNT_L_LIM_VAL;
 
-  pcnt_config_01.unit = PCNT_UNIT_01;                           // Select pulse unit
-  pcnt_config_01.channel = PCNT_CHANNEL_0;                      // Select PCNT channel 0
-  pcnt_unit_config(&pcnt_config_01);                            // Configure PCNT
+  // Set unit, channel & initialize
+  pcnt_config_01.unit = PCNT_UNIT_01;
+  pcnt_config_01.channel = PCNT_CHANNEL_0;
+  pcnt_unit_config(&pcnt_config_01);
 
-  pcnt_set_filter_value(PCNT_UNIT_01, PCNT_FILTER_VAL);         // Maximum filter_val should be limited to 1023.
-  pcnt_filter_enable(PCNT_UNIT_01);                             // Enable filter
+  pcnt_counter_pause(PCNT_UNIT_01);
+  pcnt_counter_clear(PCNT_UNIT_01);
 
-  pcnt_event_enable(PCNT_UNIT_01, PCNT_EVT_H_LIM);              // Enable event for when PCNT watch point event: Maximum counter value
-  pcnt_event_enable(PCNT_UNIT_01, PCNT_EVT_L_LIM);
+  pcnt_set_filter_value(PCNT_UNIT_01, PCNT_FILTER_VAL);
+  pcnt_filter_enable(PCNT_UNIT_01);
 
-  pcnt_isr_register(Counter_ISR, NULL, 0, &user_isr_handle);    // Set call back function for the Event
-  pcnt_intr_enable(PCNT_UNIT_01);                               // Enable Pulse Counter (PCNT)
-
-  pcnt_counter_pause(PCNT_UNIT_01);                             // Pause PCNT counter
-  pcnt_counter_clear(PCNT_UNIT_01);                             // Clear PCNT counter
+  pcnt_event_enable(PCNT_UNIT_01, PCNT_EVT_H_LIM);
+  //pcnt_event_enable(PCNT_UNIT_01, PCNT_EVT_L_LIM);
+  pcnt_isr_register(Counter_ISR_1, NULL, 0, &user_isr_handle_1);
+  pcnt_intr_enable(PCNT_UNIT_01);
 
   pcnt_counter_resume(PCNT_UNIT_01);
   
@@ -886,38 +913,36 @@ static void Init_PulseCounter_01(void)
 
 static void Init_PulseCounter_02(void)
 {
-  pcnt_config_t pcnt_config_02 = { };
-
-  pcnt_config_02.pulse_gpio_num = PCNT_INPUT_SIG_IO_02;         // Set pulse input GPIO member
-  //pcnt_config_02.ctrl_gpio_num = PCNT_PIN_NOT_USED;
+  pcnt_config_02.pulse_gpio_num = PCNT_INPUT_SIG_IO_02;
+  pcnt_config_02.ctrl_gpio_num = PCNT_PIN_NOT_USED;
 
   // What to do on the positive / negative edge of pulse input?
-  pcnt_config_02.pos_mode = PCNT_COUNT_INC;   // Count up on the positive edge
-  //pcnt_config_02.neg_mode = PCNT_COUNT_DIS;   // Count down disable
+  pcnt_config_02.pos_mode = PCNT_COUNT_INC;
+  pcnt_config_02.neg_mode = PCNT_COUNT_DIS;
 
   // What to do when control input is low or high?
-  pcnt_config_02.lctrl_mode = PCNT_MODE_KEEP; // Keep the primary counter mode if low
-  pcnt_config_02.hctrl_mode = PCNT_MODE_KEEP;    // Keep the primary counter mode
+  pcnt_config_02.lctrl_mode = PCNT_MODE_KEEP;
+  pcnt_config_02.hctrl_mode = PCNT_MODE_KEEP;
 
   // Set the maximum and minimum limit values to watch
   pcnt_config_02.counter_h_lim  = PCNT_H_LIM_VAL;
-  pcnt_config_02.counter_l_lim  = PCNT_L_LIM_VAL;
+  //pcnt_config_02.counter_l_lim  = PCNT_L_LIM_VAL;
 
-  pcnt_config_02.unit = PCNT_UNIT_02;                           // Select pulse unit
-  pcnt_config_02.channel = PCNT_CHANNEL_1;                      // Select PCNT channel 1
-  pcnt_unit_config(&pcnt_config_02);                            // Configure PCNT
+  // Set unit, channel & initialize
+  pcnt_config_02.unit = PCNT_UNIT_02;
+  pcnt_config_02.channel = PCNT_CHANNEL_1;
+  pcnt_unit_config(&pcnt_config_02);
 
-  pcnt_set_filter_value(PCNT_UNIT_02, PCNT_FILTER_VAL);         // Set filter value
-  pcnt_filter_enable(PCNT_UNIT_02);                             // Enable filter
+  pcnt_counter_pause(PCNT_UNIT_02);
+  pcnt_counter_clear(PCNT_UNIT_02);
 
-  pcnt_event_enable(PCNT_UNIT_01, PCNT_EVT_H_LIM);              // Enable event for when PCNT watch point event: Maximum counter value
-  pcnt_event_enable(PCNT_UNIT_01, PCNT_EVT_L_LIM);
+  pcnt_set_filter_value(PCNT_UNIT_02, PCNT_FILTER_VAL);
+  pcnt_filter_enable(PCNT_UNIT_02);
 
-  pcnt_isr_register(Counter_ISR, NULL, 0, &user_isr_handle);    // Set call back function for the Event
-  pcnt_intr_enable(PCNT_UNIT_02);                               // Enable Pulse Counter (PCNT)
-
-  pcnt_counter_pause(PCNT_UNIT_02);                             // Pause PCNT counter
-  pcnt_counter_clear(PCNT_UNIT_02);                             // Clear PCNT counter
+  pcnt_event_enable(PCNT_UNIT_02, PCNT_EVT_H_LIM);
+  //pcnt_event_enable(PCNT_UNIT_02, PCNT_EVT_L_LIM);
+  pcnt_isr_register(Counter_ISR_2, NULL, 0, &user_isr_handle_2);
+  pcnt_intr_enable(PCNT_UNIT_02);
 
   pcnt_counter_resume(PCNT_UNIT_02);
   
@@ -927,12 +952,15 @@ static void Init_PulseCounter_02(void)
 // Function to clean the Counter and its variables
 static void Clean_Counters()                                       
 {
-  pcnt_counter_pause(PCNT_UNIT_01);    // Pause Pulse counters such that we can set event
+  // Pause Pulse counters such that we can set event
+  pcnt_counter_pause(PCNT_UNIT_01);
   pcnt_counter_pause(PCNT_UNIT_02);
 
-  pcnt_counter_clear(PCNT_UNIT_01);    // Clean Pulse Counters
+  // Clean Pulse Counters
+  pcnt_counter_clear(PCNT_UNIT_01);
   pcnt_counter_clear(PCNT_UNIT_02);
 
-  pcnt_counter_resume(PCNT_UNIT_01);   // Resume Pulse Counters
+  // Resume Pulse Counters
+  pcnt_counter_resume(PCNT_UNIT_01);
   pcnt_counter_resume(PCNT_UNIT_02);
 }
